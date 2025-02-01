@@ -43,7 +43,10 @@ def generate_audio(
             raise ValueError("Please provide a prompt audio file (upload or record)")
 
         # 准备请求数据
-        files = {'prompt_audio': ('prompt.wav', open(prompt_audio, 'rb'), 'audio/wav')}
+        with open(prompt_audio, 'rb') as f:
+            audio_data = f.read()
+            
+        files = {'prompt_audio': ('prompt.wav', audio_data, 'audio/wav')}
         data = {
             'text': tts_text,
             'stream': str(stream).lower(),
@@ -59,7 +62,7 @@ def generate_audio(
             data['prompt_text'] = prompt_text
 
         # 发送请求
-        response = requests.post(endpoint, files=files, data=data)
+        response = requests.post(endpoint, files=files, data=data, stream=True)
         
         if response.status_code != 200:
             error_msg = f"API request failed with status {response.status_code}"
@@ -72,7 +75,9 @@ def generate_audio(
 
         # 保存返回的音频到临时文件
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-            temp_file.write(response.content)
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    temp_file.write(chunk)
             temp_file_path = temp_file.name
 
         return temp_file_path
@@ -101,43 +106,39 @@ def main():
                     prompt_wav_record = gr.Audio(
                         label='Prompt Speech Record',
                         type='filepath',
-                        sources=["microphone"])
+                        sources=['microphone'])
                 with gr.Row():
                     seed = gr.Number(label='Seed',
-                                   value=generate_seed(),
+                                   value=generate_seed,
                                    precision=0)
                     stream = gr.Checkbox(label='Stream', value=False)
-                    speed = gr.Slider(minimum=0.5,
+                    speed = gr.Slider(label='Speed',
+                                    minimum=0.5,
                                     maximum=2.0,
                                     value=1.0,
-                                    step=0.1,
-                                    label='Speed')
-            with gr.Column():
-                audio_output = gr.Audio(label='Output Speech',
-                                      type='filepath')
-                with gr.Row():
-                    gen_btn = gr.Button('Generate', variant='primary')
+                                    step=0.1)
+                generate_btn = gr.Button('Generate', variant='primary')
+                output_audio = gr.Audio(label='Output', type='filepath')
 
-        gen_btn.click(fn=generate_audio,
-                     inputs=[
-                         tts_text, mode_checkbox_group, prompt_text,
-                         prompt_wav_upload, prompt_wav_record, instruction_text,
-                         seed, stream, speed
-                     ],
-                     outputs=[audio_output])
+        # 事件处理
         mode_checkbox_group.change(fn=change_instruction,
                                  inputs=[mode_checkbox_group],
                                  outputs=[instruction_text])
+        
+        generate_btn.click(
+            fn=generate_audio,
+            inputs=[
+                tts_text, mode_checkbox_group, prompt_text, prompt_wav_upload,
+                prompt_wav_record, instruction_text, seed, stream, speed
+            ],
+            outputs=[output_audio]
+        )
 
-    # 修改启动配置
-    demo.queue()  # 使用默认配置
-    demo.launch(
-        server_name='0.0.0.0', 
-        server_port=8508,
-        share=False,  # 不创建公共链接
-        show_error=True,  # 显示详细错误信息
-        quiet=True  # 减少不必要的输出
-    )
+        # 设置队列
+        demo.queue()
+
+    # 启动服务
+    demo.launch(server_name="0.0.0.0", server_port=8508)
 
 if __name__ == '__main__':
     main()
