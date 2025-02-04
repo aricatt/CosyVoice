@@ -4,6 +4,10 @@ import io
 import numpy as np
 import torch
 import torchaudio
+from typing import List, Dict, Any, Generator, Union
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.responses import StreamingResponse, Response
+from tqdm import tqdm
 import librosa
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Response
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -15,7 +19,9 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 import uvicorn
 import time
-from tqdm import tqdm
+from datetime import datetime
+import soundfile as sf
+
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -44,17 +50,23 @@ class ModelManager:
             speech = np.array(speech)
         return speech
     
-    def inference_zero_shot(self, text, prompt_text, prompt_speech, stream=False, speed=1.0):
-        """封装zero-shot推理，确保输出格式正确"""
+    def inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0):
+        """Zero-shot TTS inference"""
+        # 生成语音
         audio_chunks = self.model.inference_zero_shot(
-            text, prompt_text, prompt_speech,
-            stream=stream, speed=speed
+            tts_text=tts_text,
+            prompt_text=prompt_text,
+            prompt_speech_16k=prompt_speech_16k,
+            stream=stream,
+            speed=speed
         )
         
-        # 处理生成器输出
+        # 如果不是生成器，直接返回
+        if not hasattr(audio_chunks, '__iter__'):
+            return audio_chunks
+        
+        # 如果是生成器，逐个返回
         for chunk in audio_chunks:
-            if "tts_speech" in chunk:
-                chunk["tts_speech"] = self.process_model_output(chunk["tts_speech"])
             yield chunk
     
     def inference_instruct2(self, text, instruct_text, prompt_speech, stream=False, speed=1.0):
@@ -67,7 +79,7 @@ class ModelManager:
         # 处理生成器输出
         for chunk in audio_chunks:
             if "tts_speech" in chunk:
-                chunk["tts_speech"] = self.process_model_output(chunk["tts_speech"])
+                chunk["tts_speech"] = chunk["tts_speech"].numpy().flatten()
             yield chunk
     
     def cleanup(self):
@@ -99,51 +111,94 @@ class TTSRequest(BaseModel):
     stream: bool = False
     speed: float = 1.0
 
-def postprocess(speech, max_val=0.95):
-    """后处理音频数据"""
+def postprocess(speech, top_db=60, hop_length=220, win_length=440):
+    """与 webui.py 保持一致的后处理"""
+    return speech
     try:
-        # 记录输入信息
-        logger.info(f"Postprocess input type: {type(speech)}")
+        # 如果是 numpy 数组，转换为 tensor
+        if isinstance(speech, np.ndarray):
+            speech = torch.from_numpy(speech)
         
-        # 确保是numpy数组
-        if isinstance(speech, torch.Tensor):
-            speech = speech.detach().cpu().numpy()
-        elif not isinstance(speech, np.ndarray):
-            speech = np.array(speech)
-        
-        logger.info(f"Array shape after conversion: {speech.shape}")
-        
-        # 如果是2D数组，转换为1D
-        if speech.ndim == 2:
-            logger.info("Squeezing 2D array to 1D")
-            speech = speech.squeeze()
-        
-        # 去除DC偏移
-        speech = speech - np.mean(speech)
+        # 确保是二维数组 [1, T]
+        if speech.ndim == 1:
+            speech = speech.unsqueeze(0)
+            
+        # 裁剪静音
+        speech_np = speech.numpy().flatten()
+        speech_trimmed, _ = librosa.effects.trim(
+            speech_np, 
+            top_db=top_db,
+            frame_length=win_length,
+            hop_length=hop_length
+        )
+        speech = torch.from_numpy(speech_trimmed).unsqueeze(0)
         
         # 音量归一化
-        if np.abs(speech).max() > 0:
-            logger.info("Normalizing audio volume")
-            speech = speech / np.abs(speech).max() * max_val
+        max_val = 0.8
+        if speech.abs().max() > max_val:
+            speech = speech / speech.abs().max() * max_val
+            
+        # 添加尾部静音
+        speech = torch.concat([speech, torch.zeros(1, int(16000 * 0.2))], dim=1)
         
-        # 应用淡入淡出以避免爆音
-        fade_length = min(1600, len(speech) // 20)  # 淡入淡出长度，最长0.1秒
-        fade_in = np.linspace(0, 1, fade_length)
-        fade_out = np.linspace(1, 0, fade_length)
-        speech[:fade_length] *= fade_in
-        speech[-fade_length:] *= fade_out
-        
-        # 应用低通滤波器去除高频噪声
-        from scipy import signal
-        b, a = signal.butter(4, 0.95, 'low')
-        speech = signal.filtfilt(b, a, speech)
-        
-        logger.info(f"Final audio shape: {speech.shape}")
-        logger.info("Postprocessing completed successfully")
         return speech
         
     except Exception as e:
         logger.error(f"Error in postprocess: {str(e)}")
+        raise
+
+def postprocess_audio(audio):
+    """后处理音频数据"""
+    try:
+        logger.info(f"Postprocess input type: {type(audio)}")
+        
+        # 如果是PyTorch tensor，转换为numpy数组
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().cpu().numpy()
+            logger.info(f"Array shape after conversion: {audio.shape}")
+        
+        # 确保是一维数组
+        if audio.ndim == 2:
+            if audio.shape[0] == 1:  # (1, N) 形状
+                audio = audio.squeeze(0)
+                logger.info("Squeezing 2D array to 1D")
+        
+        # 裁剪超出范围的值
+        audio = np.clip(audio, -1.0, 1.0)
+        
+        # 归一化音量
+        logger.info("Normalizing audio volume")
+        if np.abs(audio).max() > 0:
+            # 使用 RMS 归一化而不是峰值归一化
+            rms = np.sqrt(np.mean(audio ** 2))
+            target_rms = 0.2
+            audio = audio * (target_rms / rms)
+            # 确保峰值不超过阈值
+            peak = np.abs(audio).max()
+            if peak > 0.95:
+                audio = audio * (0.95 / peak)
+        
+        # 去除DC偏移
+        audio = audio - np.mean(audio)
+        
+        # 应用预加重滤波器增强高频特征
+        pre_emphasis = 0.97
+        audio = np.append(audio[0], audio[1:] - pre_emphasis * audio[:-1])
+        
+        # 应用更平滑的淡入淡出
+        fade_length = min(3200, len(audio) // 10)  # 最长0.2秒
+        fade_in = np.sqrt(np.linspace(0, 1, fade_length))  # 使用平方根曲线使淡变更自然
+        fade_out = np.sqrt(np.linspace(1, 0, fade_length))
+        audio = audio.copy()
+        audio[:fade_length] *= fade_in
+        audio[-fade_length:] *= fade_out
+        
+        logger.info(f"Final audio shape: {audio.shape}")
+        logger.info("Postprocessing completed successfully")
+        return audio
+        
+    except Exception as e:
+        logger.error(f"Error in postprocess_audio: {str(e)}")
         raise
 
 def prepare_model_input(audio):
@@ -204,16 +259,16 @@ def preprocess_audio(audio_data, target_sr=16000):
                     logger.warning(f"Multi-channel audio detected, using first channel. Shape: {audio.shape}")
                     audio = audio[:, 0]
             
-            # 去除静音部分
-            threshold = 0.005  # 降低静音阈值
+            # 去除静音部分，但保留更多的上下文
+            threshold = 0.003  # 降低静音阈值，保留更多声音特征
             energy = np.abs(audio)
             mask = energy > threshold
             if np.any(mask):
                 start = np.argmax(mask)
                 end = len(audio) - np.argmax(mask[::-1])
-                # 在有效音频前后保留一小段静音
-                start = max(0, start - int(target_sr * 0.1))  # 前面保留0.1秒
-                end = min(len(audio), end + int(target_sr * 0.1))  # 后面保留0.1秒
+                # 在有效音频前后保留更多的上下文
+                start = max(0, start - int(target_sr * 0.2))  # 前面保留0.2秒
+                end = min(len(audio), end + int(target_sr * 0.2))  # 后面保留0.2秒
                 audio = audio[start:end]
             
             # 确保音频长度合适
@@ -228,15 +283,30 @@ def preprocess_audio(audio_data, target_sr=16000):
                 if np.any(mask):
                     start = np.argmax(mask)
                     end = len(audio) - np.argmax(mask[::-1])
-                    start = max(0, start - int(target_sr * 0.1))
-                    end = min(len(audio), end + int(target_sr * 0.1))
+                    start = max(0, start - int(target_sr * 0.2))
+                    end = min(len(audio), end + int(target_sr * 0.2))
                     audio = audio[start:end]
                 
-                # 如果还是太短，才进行重复
+                # 如果还是太短，使用重叠拼接而不是简单重复
                 if len(audio) < min_length:
-                    repeats = int(np.ceil(min_length / len(audio)))
-                    audio = np.tile(audio, repeats)[:min_length]
-                    logger.warning(f"Audio too short ({len(audio)/target_sr:.1f}s), repeated to {min_length/target_sr:.1f}s")
+                    logger.warning(f"Audio too short ({len(audio)/target_sr:.1f}s), using overlap-add to extend")
+                    overlap = len(audio) // 4  # 25% 重叠
+                    extended = np.zeros(min_length)
+                    pos = 0
+                    window = np.hanning(overlap * 2)
+                    while pos < min_length:
+                        if pos + len(audio) <= min_length:
+                            if pos == 0:
+                                extended[pos:pos + len(audio)] = audio
+                            else:
+                                # 应用交叉淡入淡出
+                                extended[pos:pos + overlap] = extended[pos:pos + overlap] * window[:overlap] + audio[:overlap] * window[overlap:]
+                                extended[pos + overlap:pos + len(audio)] = audio[overlap:]
+                        else:
+                            break
+                        pos += len(audio) - overlap
+                    audio = extended[:min_length]
+                    
             elif len(audio) > max_length:
                 # 取中间部分，保持句子的完整性
                 center = len(audio) // 2
@@ -246,22 +316,29 @@ def preprocess_audio(audio_data, target_sr=16000):
                 audio = audio[start:end]
                 logger.warning(f"Audio too long ({len(audio)/target_sr:.1f}s), truncated to middle {max_length/target_sr:.1f}s")
             
-            # 归一化音量
+            # 归一化音量，但保持动态范围
             if np.abs(audio).max() > 0:
-                audio = audio / np.abs(audio).max() * 0.95
+                # 使用 RMS 归一化而不是峰值归一化
+                rms = np.sqrt(np.mean(audio ** 2))
+                target_rms = 0.2
+                audio = audio * (target_rms / rms)
+                # 确保峰值不超过阈值
+                peak = np.abs(audio).max()
+                if peak > 0.95:
+                    audio = audio * (0.95 / peak)
             
             # 去除DC偏移
             audio = audio - np.mean(audio)
             
-            # 应用预加重滤波器增强高频
+            # 应用预加重滤波器增强高频特征
             pre_emphasis = 0.97
             audio = np.append(audio[0], audio[1:] - pre_emphasis * audio[:-1])
             
-            # 应用淡入淡出
-            fade_length = min(1600, len(audio) // 20)  # 最长0.1秒
-            fade_in = np.linspace(0, 1, fade_length)
-            fade_out = np.linspace(1, 0, fade_length)
-            audio = audio.copy()  # 创建副本以避免修改原始数据
+            # 应用更平滑的淡入淡出
+            fade_length = min(3200, len(audio) // 10)  # 最长0.2秒
+            fade_in = np.sqrt(np.linspace(0, 1, fade_length))  # 使用平方根曲线使淡变更自然
+            fade_out = np.sqrt(np.linspace(1, 0, fade_length))
+            audio = audio.copy()
             audio[:fade_length] *= fade_in
             audio[-fade_length:] *= fade_out
             
@@ -275,85 +352,137 @@ def preprocess_audio(audio_data, target_sr=16000):
         logger.error(f"Error in preprocess_audio: {str(e)}")
         raise
 
-@app.get("/")
-async def root():
-    return {"message": "CosyVoice API is running"}
-
 async def zero_shot_tts(text, audio_data, prompt_text=None):
     """Zero-shot TTS 生成"""
     try:
-        logger.info("Starting inference_zero_shot")
-        
-        # 预处理音频数据
-        audio = preprocess_audio(audio_data)
-        audio = prepare_model_input(audio)
-        
-        # 如果没有提供 prompt_text，使用生成文本
-        if not prompt_text:
-            prompt_text = text
-        
-        # 检查文本长度
-        if len(text) < len(prompt_text):
-            logger.warning(f"synthesis text {text} too short than prompt text {prompt_text}, this may lead to bad performance")
-        
-        # 记录生成参数
-        logger.info(f"synthesis text {text}")
+        # 加载并处理音频
+        with io.BytesIO(audio_data) as audio_io:
+            # 创建带时间戳的临时文件名
+            current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_wav_path = os.path.abspath(f"temp-{current_time}.wav")
+            
+            # 保存到临时文件
+            with open(temp_wav_path, "wb") as f:
+                f.write(audio_io.read())
+            
+            logger.info(f"Saved prompt audio to: {temp_wav_path}")
+            
+            # 加载音频
+            prompt_speech = load_wav(temp_wav_path, target_sr=16000)
+            
+            # 不删除文件，保留供后续分析
+            # os.remove(temp_wav_path)
         
         # 生成语音
         audio_chunks = model_manager.inference_zero_shot(
-            text=text,
+            tts_text=text,
             prompt_text=prompt_text,
-            prompt_speech=audio,
-            stream=False,  # 关闭流式生成，一次性生成完整音频
+            prompt_speech_16k=prompt_speech,
+            stream=False,
             speed=1.0
         )
         
-        logger.info("Got audio chunks from model")
-        logger.info(f"audio_chunks type: {type(audio_chunks)}")
-        
         # 如果不是生成器，直接处理
         if not hasattr(audio_chunks, '__iter__'):
-            speech = audio_chunks['tts_speech']
-            processed_speech = postprocess(speech)
-            final_audio = (processed_speech * 32767).astype(np.int16)
-            duration = len(final_audio) / 16000
-            logger.info(f"Final audio duration: {duration:.2f} seconds")
-            return final_audio
+            if 'tts_speech' not in audio_chunks:
+                raise ValueError("No tts_speech in model output")
+
+            raw_speech = audio_chunks['tts_speech']
+            current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.abspath(f"webui_output-{current_time}")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 保存原始音频
+            raw_wav_path = os.path.join(output_dir, "raw_speecha.wav")
+            sf.write(raw_wav_path, raw_speech.numpy().flatten(), 24000)
+            logging.info(f"A Saved raw speech to: {raw_wav_path}")
+
+            yield audio_chunks['tts_speech']
         
-        # 处理生成的音频块
-        all_chunks = []
-        total_duration = 0
-        start_time = time.time()
-        
-        for i, chunk in enumerate(tqdm(audio_chunks)):
+        # 处理生成器输出
+        for chunk in tqdm(audio_chunks):
             if 'tts_speech' not in chunk:
-                logger.warning(f"Missing tts_speech in chunk {i}")
+                logger.warning("No tts_speech in chunk")
                 continue
+
+            raw_speech = chunk['tts_speech']
+            current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = os.path.abspath(f"webui_output-{current_time}")
+            os.makedirs(output_dir, exist_ok=True)
             
-            speech = chunk['tts_speech']
-            processed_speech = postprocess(speech)
-            all_chunks.append(processed_speech)
-            
-            chunk_duration = len(processed_speech) / 16000
-            total_duration += chunk_duration
-            rtf = (time.time() - start_time) / total_duration
-            logger.info(f"yield speech len {chunk_duration:.2f}, rtf {rtf}")
-        
-        # 合并所有音频块
-        if not all_chunks:
-            raise ValueError("No valid audio chunks generated")
-        
-        final_audio = np.concatenate(all_chunks)
-        final_audio = postprocess(final_audio)  # 对整体再次进行后处理
-        final_audio = (final_audio * 32767).astype(np.int16)
-        
-        duration = len(final_audio) / 16000
-        logger.info(f"Final audio duration: {duration:.2f} seconds")
-        return final_audio
+            # 保存原始音频
+            raw_wav_path = os.path.join(output_dir, "raw_speechb.wav")
+            sf.write(raw_wav_path, raw_speech.numpy().flatten(), 24000)
+            logging.info(f"B Saved raw speech to: {raw_wav_path}")
+            yield chunk['tts_speech']
         
     except Exception as e:
         logger.error(f"Error in zero_shot_tts: {str(e)}")
         raise
+
+async def inference_zero_shot(text, audio_data, prompt_text=None):
+    """零样本语音合成"""
+    try:
+        # 加载并处理音频
+        with io.BytesIO(audio_data) as audio_io:
+            # 创建带时间戳的临时文件名
+            current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_wav_path = os.path.abspath(f"temp-{current_time}.wav")
+            
+            # 保存到临时文件
+            with open(temp_wav_path, "wb") as f:
+                f.write(audio_io.read())
+            
+            logger.info(f"Saved prompt audio to: {temp_wav_path}")
+            
+            # 加载音频
+            prompt_speech = load_wav(temp_wav_path, target_sr=16000)
+            
+            # 不删除文件，保留供后续分析
+            # os.remove(temp_wav_path)
+        
+        # 后处理音频
+        prompt_speech = postprocess(prompt_speech)
+        
+        # 确保文本没有句号结尾
+        if text.endswith('。'):
+            text = text[:-1]
+        elif text.endswith('.'):
+            text = text[:-1]
+        
+        # 合成语音
+        logger.info(f"synthesis text {text}")
+        audio_chunks = model_manager.inference_zero_shot(
+            text, prompt_text, prompt_speech,
+            stream=False,  # 关闭流式生成，一次性生成完整音频
+            speed=1.0,
+            top_k=50,  # 增加采样多样性
+            top_p=0.8,  # 控制采样概率分布
+            temperature=0.7  # 稍微提高采样温度
+        )
+        logger.info("Got audio chunks from model")
+        logger.info(f"audio_chunks type: {type(audio_chunks)}")
+        
+        # 处理音频块
+        for i, chunk in enumerate(tqdm(audio_chunks)):
+            # 检查音频值范围
+            min_val = torch.min(chunk)
+            max_val = torch.max(chunk)
+            if min_val < -1.0 or max_val > 1.0:
+                logger.warning(f"Audio values out of range: min={min_val}, max={max_val}")
+                chunk = torch.clamp(chunk, -1.0, 1.0)
+            
+            # 后处理
+            # chunk = postprocess(chunk)
+            yield chunk
+            
+    except Exception as e:
+        logger.error(f"Error in inference_zero_shot: {str(e)}")
+        raise
+
+@app.get("/")
+async def root():
+    return {"message": "CosyVoice API is running"}
 
 @app.post("/tts/zero_shot")
 async def zero_shot_tts_api(
@@ -379,8 +508,16 @@ async def zero_shot_tts_api(
         logger.info(f"Uploaded audio size: {len(audio_data)} bytes")
         
         # 生成语音
-        audio = await zero_shot_tts(text, audio_data, prompt_text)
-        
+        audio_chunks = []
+        async for chunk in zero_shot_tts(text, audio_data, prompt_text):
+            # 如果是 tensor，转换为 numpy
+            if torch.is_tensor(chunk):
+                chunk = chunk.detach().cpu().numpy()
+            audio_chunks.append(chunk.flatten())
+            
+        # 合并所有音频块
+        audio = np.concatenate(audio_chunks)
+            
         # 创建内存缓冲区
         buffer = io.BytesIO()
         
@@ -393,31 +530,20 @@ async def zero_shot_tts_api(
         buffer.write((16).to_bytes(4, 'little'))  # fmt chunk size
         buffer.write((1).to_bytes(2, 'little'))  # 音频格式 (PCM)
         buffer.write((1).to_bytes(2, 'little'))  # 通道数
-        buffer.write((16000).to_bytes(4, 'little'))  # 采样率
-        buffer.write((32000).to_bytes(4, 'little'))  # 字节率
+        buffer.write((24000).to_bytes(4, 'little'))  # 采样率
+        buffer.write((48000).to_bytes(4, 'little'))  # 字节率 (采样率 * 2)
         buffer.write((2).to_bytes(2, 'little'))  # 块对齐
         buffer.write((16).to_bytes(2, 'little'))  # 位深度
         buffer.write(b'data')
         buffer.write((len(audio) * 2).to_bytes(4, 'little'))  # 数据大小
         
         # 写入音频数据
-        buffer.write(audio.tobytes())
+        audio_int16 = (audio * 32767).astype(np.int16)
+        buffer.write(audio_int16.tobytes())
         
-        # 将缓冲区指针移到开始
+        # 返回音频文件
         buffer.seek(0)
-        
-        # 读取所有数据
-        content = buffer.read()
-        
-        # 返回完整的WAV文件
-        return Response(
-            content=content,
-            media_type="audio/wav",
-            headers={
-                "Content-Length": str(len(content)),
-                "Content-Disposition": 'attachment; filename="generated.wav"'
-            }
-        )
+        return StreamingResponse(buffer, media_type="audio/wav")
         
     except Exception as e:
         logger.error(f"Error in zero_shot_tts_api: {str(e)}")
@@ -451,7 +577,7 @@ async def instruct_tts(
         logger.info(f"After preprocess shape: {prompt_speech.shape}")
         logger.info(f"Audio duration: {len(prompt_speech)/16000:.2f} seconds")
         
-        prompt_speech = postprocess(prompt_speech)
+        prompt_speech = postprocess_audio(prompt_speech)
         logger.info(f"After postprocess shape: {prompt_speech.shape}")
         
         # 准备模型输入
@@ -501,7 +627,7 @@ async def instruct_tts(
                 
                 # 应用后处理
                 try:
-                    speech = postprocess(speech)
+                    speech = postprocess_audio(speech)
                     logger.info("Postprocessing successful")
                 except Exception as e:
                     logger.error(f"Error in postprocessing: {str(e)}")
@@ -524,8 +650,8 @@ async def instruct_tts(
             wav_header.write((16).to_bytes(4, 'little'))  # fmt chunk size
             wav_header.write((1).to_bytes(2, 'little'))  # 音频格式 (PCM)
             wav_header.write((1).to_bytes(2, 'little'))  # 通道数
-            wav_header.write((16000).to_bytes(4, 'little'))  # 采样率
-            wav_header.write((32000).to_bytes(4, 'little'))  # 字节率
+            wav_header.write((24000).to_bytes(4, 'little'))  # 采样率
+            wav_header.write((48000).to_bytes(4, 'little'))  # 字节率 (采样率 * 2)
             wav_header.write((2).to_bytes(2, 'little'))  # 块对齐
             wav_header.write((16).to_bytes(2, 'little'))  # 位深度
             wav_header.write(b'data')

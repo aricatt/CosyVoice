@@ -42,6 +42,15 @@ def generate_audio(
         if not prompt_audio:
             raise ValueError("Please provide a prompt audio file (upload or record)")
 
+        # 记录音频文件信息
+        logger.info(f"Using audio file: {prompt_audio}")
+        logger.info(f"File exists: {os.path.exists(prompt_audio)}")
+        logger.info(f"File size: {os.path.getsize(prompt_audio)} bytes")
+        
+        # 使用 torchaudio 读取音频信息
+        waveform, sample_rate = torchaudio.load(prompt_audio)
+        logger.info(f"Audio shape: {waveform.shape}, Sample rate: {sample_rate}")
+
         # 准备请求数据
         with open(prompt_audio, 'rb') as f:
             audio_data = f.read()
